@@ -6,6 +6,10 @@
   "scripts": {
     "start": "node server.js"
   },
+  "dependencies": {
+    "@coinbase/x402": "^2.1.0",
+    "@x402/core": "^2.0.0"
+  },
   "engines": {
     "node": ">=18"
   },
