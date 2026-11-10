@@ -546,8 +546,8 @@
     return '<span class="ev-val ' + cls + '">' + esc(status) + '</span>';
   }
 
-  function badgeFor(cls, text) {
-    return '<span class="section-badge badge-' + cls + '">' + esc(text) + '</span>';
+  function badgeFor(id, cls, text) {
+    return '<span id="' + id + '" class="section-badge badge-' + cls + '">' + esc(text) + '</span>';
   }
 
   // ── Render simulation section ────────────────────────────────────────────
@@ -582,10 +582,10 @@
     // Badge
     var n1 = sim.node1.status, n2 = sim.node2.status;
     var badge;
-    if (n1 === 'success' && n2 === 'success')      badge = badgeFor('ok', 'both pass');
-    else if (n1 === 'success' || n2 === 'success') badge = badgeFor('warn', 'one pass');
-    else if (n1 === 'revert' || n2 === 'revert')   badge = badgeFor('fail', 'reverted');
-    else                                            badge = badgeFor('neutral', 'unavailable');
+    if (n1 === 'success' && n2 === 'success')      badge = badgeFor('badge-sim', 'ok', 'both pass');
+    else if (n1 === 'success' || n2 === 'success') badge = badgeFor('badge-sim', 'warn', 'one pass');
+    else if (n1 === 'revert' || n2 === 'revert')   badge = badgeFor('badge-sim', 'fail', 'reverted');
+    else                                            badge = badgeFor('badge-sim', 'neutral', 'unavailable');
     document.getElementById('badge-sim').outerHTML = badge;
   }
 
@@ -637,9 +637,9 @@
     });
     var anyIndexed = goplus.token.indexed || goplus.nft.indexed;
     var badge;
-    if (anyRed)       badge = badgeFor('fail', 'flagged');
-    else if (anyIndexed) badge = badgeFor('ok', 'no flags');
-    else              badge = badgeFor('neutral', 'not indexed');
+    if (anyRed)       badge = badgeFor('badge-gp', 'fail', 'flagged');
+    else if (anyIndexed) badge = badgeFor('badge-gp', 'ok', 'no flags');
+    else              badge = badgeFor('badge-gp', 'neutral', 'not indexed');
     document.getElementById('badge-gp').outerHTML = badge;
   }
 
@@ -658,9 +658,9 @@
     document.getElementById('body-src').innerHTML = html;
 
     var badge;
-    if (match === 'exact_match')   badge = badgeFor('ok', 'exact match');
-    else if (match === 'partial_match') badge = badgeFor('warn', 'partial match');
-    else                           badge = badgeFor('neutral', 'unverified');
+    if (match === 'exact_match')   badge = badgeFor('badge-src', 'ok', 'exact match');
+    else if (match === 'partial_match') badge = badgeFor('badge-src', 'warn', 'partial match');
+    else                           badge = badgeFor('badge-src', 'neutral', 'unverified');
     document.getElementById('badge-src').outerHTML = badge;
   }
 
