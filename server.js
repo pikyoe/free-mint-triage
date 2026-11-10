@@ -458,8 +458,83 @@ function parseQuery(urlStr) {
   return out;
 }
 
+// ─── BotWork agent webhook (v1) ─────────────────────────────────────────────
+// BotWork sends paid tasks here as POST { taskId, payload } and expects a
+// fast 200. Ara picks queued tasks up on a poll loop; results go back
+// through BotWork's own completion path (dashboard / Telegram bot).
+// NOTE: Render free tier sleeps when idle — first hit after idle wakes ~50s.
+const BOTWORK_TASKS_FILE = path.join(__dirname, 'botwork-tasks.jsonl');
+let botworkQueue = [];
+
+function readBody(req, limitBytes = 1_000_000) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > limitBytes) { reject(new Error('body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function botworkStore(task) {
+  botworkQueue.push(task);
+  if (botworkQueue.length > 200) botworkQueue = botworkQueue.slice(-200);
+  fs.appendFile(BOTWORK_TASKS_FILE, JSON.stringify(task) + '\n', () => {});
+}
+
+async function handleBotwork(req, res) {
+  if (req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, agent: 'zhi19', queued: botworkQueue.length }));
+    return;
+  }
+  if (req.method !== 'POST') {
+    res.writeHead(405, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'method not allowed' }));
+    return;
+  }
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (err) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'invalid JSON body' }));
+    return;
+  }
+  const task = {
+    taskId: body.taskId || body.task_id || body.id || null,
+    payload: body.payload ?? body.task ?? body.prompt ?? body.description ?? null,
+    receivedAt: new Date().toISOString(),
+    raw: body,
+  };
+  botworkStore(task);
+  console.log(`[botwork] task received: ${task.taskId}`);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, taskId: task.taskId, status: 'queued', agent: 'zhi19' }));
+}
+
 const server = http.createServer(async (req, res) => {
   const urlPath = req.url.split('?')[0];
+
+  if (urlPath === '/botwork-webhook') {
+    try {
+      await handleBotwork(req, res);
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Internal server error' }));
+    }
+    return;
+  }
+
+  if (urlPath === '/botwork-tasks' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, agent: 'zhi19', tasks: botworkQueue }, null, 2));
+    return;
+  }
 
   if (urlPath === '/api/triage' && req.method === 'GET') {
     const query = parseQuery(req.url);
