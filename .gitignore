@@ -1,0 +1,21 @@
+# Dependencies (never committed)
+node_modules/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor directories
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment files
+.env
+.env.*
+
+# NOTE: .kiro/ is intentionally NOT ignored — steering, specs, and hooks
+# are part of the project and should be committed.

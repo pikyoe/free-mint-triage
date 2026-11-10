@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Free-Mint Triage — BNB Chain</title>
+  <style>
+    /* ── Reset & base ─────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d0f14;
+      --surface:   #161a24;
+      --border:    #2a2f3d;
+      --text:      #d4d8e8;
+      --muted:     #7a8099;
+      --accent:    #f5a623;
+      --clean:     #22c55e;
+      --clean-bg:  #052e16;
+      --amber:     #f59e0b;
+      --amber-bg:  #2d1f03;
+      --red:       #ef4444;
+      --red-bg:    #2d0a0a;
+      --radius:    6px;
+      --mono:      'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+      font-size: 15px;
+      line-height: 1.6;
+      min-height: 100vh;
+      padding: 2rem 1rem 4rem;
+    }
+
+    /* ── Layout ───────────────────────────────────────────────────────── */
+    .wrap {
+      max-width: 760px;
+      margin: 0 auto;
+    }
+
+    /* ── Header ───────────────────────────────────────────────────────── */
+    header {
+      margin-bottom: 2.5rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1.25rem;
+    }
+    header h1 {
+      font-size: 1.45rem;
+      font-weight: 700;
+      color: var(--accent);
+      letter-spacing: -0.01em;
+    }
+    header p {
+      color: var(--muted);
+      font-size: 0.875rem;
+      margin-top: 0.3rem;
+    }
+
+    /* ── Form ─────────────────────────────────────────────────────────── */
+    .form-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      margin-bottom: 1.5rem;
+    }
+
+    label {
+      display: block;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      margin-bottom: 0.4rem;
+    }
+    label span.hint {
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: 0;
+      color: var(--muted);
+      opacity: 0.75;
+    }
+
+    .field { margin-bottom: 1rem; }
+    .field:last-of-type { margin-bottom: 0; }
+
+    input[type="text"] {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 0.875rem;
+      padding: 0.6rem 0.75rem;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input[type="text"]:focus {
+      border-color: var(--accent);
+    }
+    input[type="text"]::placeholder {
+      color: var(--muted);
+      opacity: 0.5;
+    }
+    input[type="text"].invalid {
+      border-color: var(--red);
+    }
+
+    .input-error {
+      color: var(--red);
+      font-size: 0.8rem;
+      margin-top: 0.3rem;
+      display: none;
+    }
+    .input-error.visible { display: block; }
+
+    .form-actions {
+      margin-top: 1.25rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    button#check-btn {
+      background: var(--accent);
+      color: #0d0f14;
+      border: none;
+      border-radius: var(--radius);
+      font-weight: 700;
+      font-size: 0.9375rem;
+      padding: 0.6rem 1.5rem;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    button#check-btn:hover { opacity: 0.85; }
+    button#check-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* ── Status / loading ─────────────────────────────────────────────── */
+    #status-area {
+      display: none;
+      align-items: center;
+      gap: 0.6rem;
+      color: var(--muted);
+      font-size: 0.875rem;
+    }
+    #status-area.visible { display: flex; }
+
+    .spinner {
+      width: 16px; height: 16px;
+      border: 2px solid var(--border);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Error banner ─────────────────────────────────────────────────── */
+    #error-banner {
+      display: none;
+      background: var(--red-bg);
+      border: 1px solid var(--red);
+      border-radius: var(--radius);
+      padding: 0.85rem 1rem;
+      color: var(--red);
+      font-size: 0.875rem;
+      margin-bottom: 1.5rem;
+    }
+    #error-banner.visible { display: block; }
+
+    /* ── Results ──────────────────────────────────────────────────────── */
+    #results { display: none; }
+    #results.visible { display: block; }
+
+    /* Verdict badge */
+    .verdict-block {
+      border-radius: var(--radius);
+      padding: 1.25rem 1.5rem;
+      margin-bottom: 1.5rem;
+      border: 1px solid;
+    }
+    .verdict-block.clean   { background: var(--clean-bg); border-color: var(--clean); }
+    .verdict-block.ambiguous { background: var(--amber-bg); border-color: var(--amber); }
+    .verdict-block.red-flag  { background: var(--red-bg);   border-color: var(--red); }
+
+    .verdict-label {
+      font-size: 0.75rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      margin-bottom: 0.4rem;
+    }
+    .clean   .verdict-label { color: var(--clean); }
+    .ambiguous .verdict-label { color: var(--amber); }
+    .red-flag  .verdict-label { color: var(--red); }
+
+    .verdict-word {
+      font-size: 1.75rem;
+      font-weight: 800;
+      line-height: 1;
+      margin-bottom: 0.6rem;
+    }
+    .clean   .verdict-word { color: var(--clean); }
+    .ambiguous .verdict-word { color: var(--amber); }
+    .red-flag  .verdict-word { color: var(--red); }
+
+    .verdict-summary {
+      color: var(--text);
+      font-size: 0.9375rem;
+    }
+
+    .verdict-meta {
+      margin-top: 0.75rem;
+      font-size: 0.8rem;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+
+    /* Evidence sections */
+    .section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-bottom: 1rem;
+      overflow: hidden;
+    }
+
+    .section-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--border);
+      cursor: pointer;
+      user-select: none;
+    }
+    .section-header:hover { background: rgba(255,255,255,0.03); }
+
+    .section-title {
+      font-weight: 600;
+      font-size: 0.875rem;
+    }
+
+    .section-badge {
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 0.2rem 0.6rem;
+      border-radius: 999px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .badge-ok      { background: rgba(34,197,94,.15);  color: var(--clean); }
+    .badge-warn    { background: rgba(245,158,11,.15); color: var(--amber); }
+    .badge-fail    { background: rgba(239,68,68,.15);  color: var(--red); }
+    .badge-neutral { background: rgba(122,128,153,.15); color: var(--muted); }
+
+    .section-body {
+      padding: 0.85rem 1rem;
+    }
+    .section-body.collapsed { display: none; }
+
+    .chevron {
+      color: var(--muted);
+      font-size: 0.75rem;
+      transition: transform 0.2s;
+    }
+    .chevron.open { transform: rotate(180deg); }
+
+    /* Evidence rows */
+    .ev-row {
+      display: grid;
+      grid-template-columns: 160px 1fr;
+      gap: 0.4rem 0.75rem;
+      font-size: 0.8375rem;
+      padding: 0.35rem 0;
+      border-bottom: 1px solid rgba(42,47,61,.6);
+      align-items: start;
+    }
+    .ev-row:last-child { border-bottom: none; }
+
+    .ev-key {
+      color: var(--muted);
+      font-family: var(--mono);
+      word-break: break-all;
+    }
+    .ev-val {
+      color: var(--text);
+      font-family: var(--mono);
+      word-break: break-all;
+    }
+    .ev-val.ok   { color: var(--clean); }
+    .ev-val.warn { color: var(--amber); }
+    .ev-val.fail { color: var(--red); }
+
+    /* Node sim sub-table */
+    .node-block {
+      margin-bottom: 0.75rem;
+      padding-bottom: 0.75rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .node-block:last-child {
+      margin-bottom: 0;
+      padding-bottom: 0;
+      border-bottom: none;
+    }
+    .node-url {
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--muted);
+      margin-bottom: 0.4rem;
+      word-break: break-all;
+    }
+
+    /* Flag list */
+    .flag-list {
+      list-style: none;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin-top: 0.4rem;
+    }
+    .flag-list li {
+      font-size: 0.75rem;
+      font-family: var(--mono);
+      padding: 0.15rem 0.5rem;
+      border-radius: 4px;
+      background: rgba(239,68,68,.12);
+      color: var(--red);
+      border: 1px solid rgba(239,68,68,.3);
+    }
+    .flag-list li.neutral {
+      background: rgba(122,128,153,.1);
+      color: var(--muted);
+      border-color: var(--border);
+    }
+
+    /* ── Disclaimer ───────────────────────────────────────────────────── */
+    .disclaimer {
+      margin-top: 2rem;
+      padding: 1rem;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 0.8125rem;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+    .disclaimer strong { color: var(--text); }
+
+    /* ── Footer ───────────────────────────────────────────────────────── */
+    footer {
+      margin-top: 3rem;
+      padding-top: 1rem;
+      border-top: 1px solid var(--border);
+      text-align: center;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>🎃 Free-Mint Triage</h1>
+    <p>Read-only first-pass check for BNB Chain NFT contracts — no wallet, no signing, no transactions.</p>
+  </header>
+
+  <!-- Form -->
+  <div class="form-card">
+    <div class="field">
+      <label for="contract-input">Contract address <span class="hint">(required)</span></label>
+      <input type="text" id="contract-input" placeholder="0x…" autocomplete="off" spellcheck="false" maxlength="42">
+      <div class="input-error" id="contract-error">Must be a 0x address with 40 hex characters.</div>
+    </div>
+
+    <div class="field">
+      <label for="from-input">
+        Your wallet address
+        <span class="hint">— optional, but Agent-ID-gated mints need your address or the sim may revert</span>
+      </label>
+      <input type="text" id="from-input" placeholder="0x… (defaults to zero address if blank)" autocomplete="off" spellcheck="false" maxlength="42">
+    </div>
+
+    <div class="form-actions">
+      <button id="check-btn" type="button">Check contract</button>
+      <div id="status-area">
+        <div class="spinner" aria-hidden="true"></div>
+        <span id="status-text">Running checks…</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Error banner -->
+  <div id="error-banner" role="alert"></div>
+
+  <!-- Results -->
+  <div id="results" aria-live="polite">
+
+    <!-- Verdict -->
+    <div id="verdict-block" class="verdict-block">
+      <div class="verdict-label" id="verdict-label">Verdict</div>
+      <div class="verdict-word" id="verdict-word"></div>
+      <div class="verdict-summary" id="verdict-summary"></div>
+      <div class="verdict-meta" id="verdict-meta"></div>
+    </div>
+
+    <!-- Section: Simulation -->
+    <div class="section" id="sec-sim">
+      <div class="section-header" role="button" tabindex="0" aria-expanded="true" data-target="body-sim">
+        <span class="section-title">On-chain simulation (eth_call)</span>
+        <div style="display:flex;align-items:center;gap:.5rem">
+          <span class="section-badge" id="badge-sim">—</span>
+          <span class="chevron open" id="chev-sim">▼</span>
+        </div>
+      </div>
+      <div class="section-body" id="body-sim"></div>
+    </div>
+
+    <!-- Section: GoPlus -->
+    <div class="section" id="sec-gp">
+      <div class="section-header" role="button" tabindex="0" aria-expanded="true" data-target="body-gp">
+        <span class="section-title">GoPlus security scan</span>
+        <div style="display:flex;align-items:center;gap:.5rem">
+          <span class="section-badge" id="badge-gp">—</span>
+          <span class="chevron open" id="chev-gp">▼</span>
+        </div>
+      </div>
+      <div class="section-body" id="body-gp"></div>
+    </div>
+
+    <!-- Section: Sourcify -->
+    <div class="section" id="sec-src">
+      <div class="section-header" role="button" tabindex="0" aria-expanded="true" data-target="body-src">
+        <span class="section-title">Sourcify source verification</span>
+        <div style="display:flex;align-items:center;gap:.5rem">
+          <span class="section-badge" id="badge-src">—</span>
+          <span class="chevron open" id="chev-src">▼</span>
+        </div>
+      </div>
+      <div class="section-body" id="body-src"></div>
+    </div>
+
+  </div><!-- /results -->
+
+  <!-- Disclaimer -->
+  <div class="disclaimer">
+    <strong>Read-only tool.</strong> This app makes no network calls on your behalf, never connects to a wallet, never signs anything, and never executes a transaction.
+    Results are a first-pass triage based on three automated checks: an <code>eth_call</code> simulation, a GoPlus security scan, and a Sourcify source-code lookup.
+    A "clean" verdict means <em>no flags found by these checks</em>, not that the contract is safe.
+    Always read the contract and do your own research before interacting with any project.
+    Nothing here constitutes investment advice.
+  </div>
+
+  <footer>Built with <a href="https://kiro.dev" style="color:var(--accent);text-decoration:none;">Kiro</a> for Kiroween 2026 · BNB Chain · read-only</footer>
+
+</div><!-- /wrap -->
+
+<script>
+(function () {
+  'use strict';
+
+  const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+
+  // ── DOM refs ────────────────────────────────────────────────────────────
+  const contractInput  = document.getElementById('contract-input');
+  const contractError  = document.getElementById('contract-error');
+  const fromInput      = document.getElementById('from-input');
+  const checkBtn       = document.getElementById('check-btn');
+  const statusArea     = document.getElementById('status-area');
+  const statusText     = document.getElementById('status-text');
+  const errorBanner    = document.getElementById('error-banner');
+  const resultsDiv     = document.getElementById('results');
+
+  const verdictBlock   = document.getElementById('verdict-block');
+  const verdictLabel   = document.getElementById('verdict-label');
+  const verdictWord    = document.getElementById('verdict-word');
+  const verdictSummary = document.getElementById('verdict-summary');
+  const verdictMeta    = document.getElementById('verdict-meta');
+
+  // ── Helpers ─────────────────────────────────────────────────────────────
+  function esc(str) {
+    if (str == null) return '';
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function hide(el) { el.classList.remove('visible'); }
+  function show(el) { el.classList.add('visible'); }
+
+  function setLoading(on) {
+    checkBtn.disabled = on;
+    if (on) { show(statusArea); } else { hide(statusArea); }
+  }
+
+  function showError(msg) {
+    errorBanner.textContent = msg;
+    show(errorBanner);
+  }
+  function clearError() { hide(errorBanner); }
+
+  function statusOf(node) {
+    if (!node) return 'unknown';
+    return node.status || 'unknown';
+  }
+
+  // ── Section collapse toggle ──────────────────────────────────────────────
+  document.querySelectorAll('.section-header').forEach(function (hdr) {
+    function toggle() {
+      var targetId = hdr.getAttribute('data-target');
+      var body = document.getElementById(targetId);
+      var chevId = 'chev-' + targetId.replace('body-', '');
+      var chev = document.getElementById(chevId);
+      var isOpen = !body.classList.contains('collapsed');
+      if (isOpen) {
+        body.classList.add('collapsed');
+        chev.classList.remove('open');
+        hdr.setAttribute('aria-expanded', 'false');
+      } else {
+        body.classList.remove('collapsed');
+        chev.classList.add('open');
+        hdr.setAttribute('aria-expanded', 'true');
+      }
+    }
+    hdr.addEventListener('click', toggle);
+    hdr.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+  });
+
+  // ── Render helpers ───────────────────────────────────────────────────────
+  function evRow(key, valHtml) {
+    return '<div class="ev-row"><span class="ev-key">' + esc(key) +
+           '</span><span class="ev-val">' + valHtml + '</span></div>';
+  }
+
+  function statusHtml(status) {
+    var cls = status === 'success' ? 'ok' : status === 'revert' ? 'fail' : 'warn';
+    return '<span class="ev-val ' + cls + '">' + esc(status) + '</span>';
+  }
+
+  function badgeFor(cls, text) {
+    return '<span class="section-badge badge-' + cls + '">' + esc(text) + '</span>';
+  }
+
+  // ── Render simulation section ────────────────────────────────────────────
+  function renderSim(sim, code) {
+    var html = '';
+
+    // Code presence
+    var codeVal;
+    if (code.exists === true)  codeVal = '<span class="ev-val ok">yes</span>';
+    else if (code.exists === false) codeVal = '<span class="ev-val fail">no — EOA or empty address</span>';
+    else codeVal = '<span class="ev-val warn">unknown</span>';
+    html += evRow('contract code', codeVal);
+
+    // Per-node results
+    [sim.node1, sim.node2].forEach(function (node) {
+      var label = node.node || 'node';
+      html += '<div class="node-block">';
+      html += '<div class="node-url">' + esc(label) + '</div>';
+      html += evRow('status',   statusHtml(node.status));
+      html += evRow('selector', '<span class="ev-val">' + esc(node.selector || '—') + '</span>');
+      if (node.detail) {
+        var detail = node.detail;
+        // Truncate very long return data
+        if (detail.length > 80) detail = detail.slice(0, 80) + '…';
+        html += evRow('detail', '<span class="ev-val">' + esc(detail) + '</span>');
+      }
+      html += '</div>';
+    });
+
+    document.getElementById('body-sim').innerHTML = html;
+
+    // Badge
+    var n1 = sim.node1.status, n2 = sim.node2.status;
+    var badge;
+    if (n1 === 'success' && n2 === 'success')      badge = badgeFor('ok', 'both pass');
+    else if (n1 === 'success' || n2 === 'success') badge = badgeFor('warn', 'one pass');
+    else if (n1 === 'revert' || n2 === 'revert')   badge = badgeFor('fail', 'reverted');
+    else                                            badge = badgeFor('neutral', 'unavailable');
+    document.getElementById('badge-sim').outerHTML = badge;
+  }
+
+  // ── Render GoPlus section ────────────────────────────────────────────────
+  var RED_FLAGS = ['is_honeypot', 'honeypot_with_same_creator', 'is_airdrop_scam'];
+
+  function renderGpSection(gp, type) {
+    var html = '';
+    if (!gp.indexed) {
+      var reason = gp.error ? esc(gp.error) : 'not indexed';
+      html += evRow(type + ' security',
+        '<span class="ev-val warn">' + reason + '</span>');
+      return html;
+    }
+
+    html += evRow(type + ' security', '<span class="ev-val ok">indexed</span>');
+
+    var flags = gp.flags || {};
+    var flagKeys = Object.keys(flags);
+    if (flagKeys.length === 0) {
+      html += evRow('flags', '<span class="ev-val ok">none returned</span>');
+    } else {
+      var listHtml = '<ul class="flag-list">';
+      flagKeys.forEach(function (k) {
+        var v = flags[k];
+        var isRed = RED_FLAGS.includes(k) && v === '1';
+        var label = k + ' = ' + v;
+        listHtml += '<li class="' + (isRed ? '' : 'neutral') + '">' + esc(label) + '</li>';
+      });
+      listHtml += '</ul>';
+      html += evRow('flags', listHtml);
+    }
+    return html;
+  }
+
+  function renderGoPlus(goplus) {
+    var html = '';
+    html += renderGpSection(goplus.token, 'token');
+    html += renderGpSection(goplus.nft,   'nft');
+    document.getElementById('body-gp').innerHTML = html;
+
+    // Badge
+    var anyRed = false;
+    ['token', 'nft'].forEach(function (t) {
+      var gp = goplus[t];
+      if (!gp.indexed) return;
+      var f = gp.flags || {};
+      if (RED_FLAGS.some(function (k) { return f[k] === '1'; })) anyRed = true;
+    });
+    var anyIndexed = goplus.token.indexed || goplus.nft.indexed;
+    var badge;
+    if (anyRed)       badge = badgeFor('fail', 'flagged');
+    else if (anyIndexed) badge = badgeFor('ok', 'no flags');
+    else              badge = badgeFor('neutral', 'not indexed');
+    document.getElementById('badge-gp').outerHTML = badge;
+  }
+
+  // ── Render Sourcify section ──────────────────────────────────────────────
+  function renderSourcify(sourcify) {
+    var html = '';
+    var match = sourcify.match;
+    var matchLabel, matchClass;
+    if (match === 'exact_match')   { matchLabel = 'exact match';   matchClass = 'ok'; }
+    else if (match === 'partial_match') { matchLabel = 'partial match'; matchClass = 'warn'; }
+    else if (!sourcify.checked)    { matchLabel = sourcify.error || 'lookup failed'; matchClass = 'warn'; }
+    else                           { matchLabel = 'not verified';  matchClass = 'warn'; }
+
+    html += evRow('match', '<span class="ev-val ' + matchClass + '">' + esc(matchLabel) + '</span>');
+
+    document.getElementById('body-src').innerHTML = html;
+
+    var badge;
+    if (match === 'exact_match')   badge = badgeFor('ok', 'exact match');
+    else if (match === 'partial_match') badge = badgeFor('warn', 'partial match');
+    else                           badge = badgeFor('neutral', 'unverified');
+    document.getElementById('badge-src').outerHTML = badge;
+  }
+
+  // ── Render verdict ───────────────────────────────────────────────────────
+  function renderVerdict(data) {
+    var v = data.verdict;
+    // Remove all state classes
+    verdictBlock.classList.remove('clean', 'ambiguous', 'red-flag');
+    verdictBlock.classList.add(v);
+
+    var labels = { 'clean': 'Verdict', 'ambiguous': 'Verdict', 'red-flag': 'Verdict' };
+    var words  = { 'clean': '✓ Clean', 'ambiguous': '⚠ Ambiguous', 'red-flag': '✗ Red flag' };
+
+    verdictLabel.textContent   = labels[v] || 'Verdict';
+    verdictWord.textContent    = words[v]  || v;
+    verdictSummary.textContent = data.summary || '';
+
+    var checkedAt = data.checked_at ? new Date(data.checked_at).toLocaleString() : '';
+    var fromNote  = (data.from && data.from !== '0x0000000000000000000000000000000000000000')
+                    ? ' · simulated from ' + data.from
+                    : ' · simulated from zero address';
+    verdictMeta.textContent = checkedAt + fromNote;
+  }
+
+  // ── Main render ──────────────────────────────────────────────────────────
+  function renderResults(data) {
+    renderVerdict(data);
+    renderSim(data.evidence.simulation, data.evidence.code);
+    renderGoPlus(data.evidence.goplus);
+    renderSourcify(data.evidence.sourcify);
+    show(resultsDiv);
+  }
+
+  // ── Check handler ────────────────────────────────────────────────────────
+  async function runCheck() {
+    // Validate contract address
+    var contract = contractInput.value.trim();
+    if (!ADDR_RE.test(contract)) {
+      contractInput.classList.add('invalid');
+      contractError.classList.add('visible');
+      contractInput.focus();
+      return;
+    }
+    contractInput.classList.remove('invalid');
+    contractError.classList.remove('visible');
+
+    var fromVal = fromInput.value.trim();
+
+    clearError();
+    hide(resultsDiv);
+    setLoading(true);
+    statusText.textContent = 'Running checks… (up to ~30s)';
+
+    var url = '/api/triage?contract=' + encodeURIComponent(contract);
+    if (fromVal) url += '&from=' + encodeURIComponent(fromVal);
+
+    try {
+      var res = await fetch(url);
+      var data = await res.json();
+
+      if (!res.ok) {
+        showError((data && data.error) ? data.error : 'Server error ' + res.status);
+        return;
+      }
+      renderResults(data);
+    } catch (err) {
+      showError('Network error: ' + (err.message || 'could not reach server'));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // ── Event listeners ──────────────────────────────────────────────────────
+  checkBtn.addEventListener('click', runCheck);
+
+  contractInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') runCheck();
+  });
+  fromInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') runCheck();
+  });
+
+  // Clear validation on input
+  contractInput.addEventListener('input', function () {
+    contractInput.classList.remove('invalid');
+    contractError.classList.remove('visible');
+  });
+
+})();
+</script>
+</body>
+</html>
