@@ -653,7 +653,11 @@ async function runDeepChecks(contract) {
 // ── Shared paid flow ────────────────────────────────────────────────────────
 // produce(payer) returns { status, body, meta } — meta is merged into the
 // sale record. Any non-200 status returns WITHOUT settling the payment.
-async function x402PaidFlow(req, res, amount, service, produce) {
+// onSettled() runs after a successful settle and before the 200 goes out:
+// use it for side effects that must only happen for a PAID request (a deep
+// job must not become queued if settle fails, or the worker would do $25 of
+// free work for an unpaid buyer).
+async function x402PaidFlow(req, res, amount, service, produce, onSettled) {
   const paymentHeader = req.headers['x-payment'];
   if (!paymentHeader) {
     res.writeHead(402, { 'Content-Type': 'application/json' });
@@ -727,6 +731,9 @@ async function x402PaidFlow(req, res, amount, service, produce) {
     ), null, 2));
     return;
   }
+  if (onSettled) {
+    try { await onSettled(); } catch (err) { console.log('[x402] onSettled failed:', err.message); }
+  }
   const sale = {
     ts: new Date().toISOString(),
     service,
@@ -783,8 +790,20 @@ async function fetchText(url, timeoutMs = 10000) {
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, { headers: { 'User-Agent': RESEARCH_UA }, signal: ctrl.signal });
-    if (!res.ok) return null;
-    return await res.text();
+    if (!res.ok || !res.body) return null;
+    // Bound the body: a hostile or giant page must not OOM the free tier.
+    const reader = res.body.getReader();
+    const chunks = [];
+    let total = 0;
+    const MAX_BYTES = 2_000_000;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > MAX_BYTES) { try { await reader.cancel(); } catch (e) { /* ignore */ } break; }
+      chunks.push(value);
+    }
+    return Buffer.concat(chunks).toString('utf8');
   } catch (err) {
     return null;
   } finally {
@@ -810,11 +829,26 @@ function stripHtmlToText(html) {
   ).replace(/\s+/g, ' ').trim();
 }
 
+// Bing's /ck/a u= parameter is base64 of the destination URL, sometimes
+// prefixed with a 2-char version marker ("a1"). Try both forms and keep the
+// first that decodes to a valid http(s) URL; otherwise null.
+function decodeBingU(raw) {
+  let v;
+  try { v = decodeURIComponent(raw); } catch (e) { v = raw; }
+  for (const cand of [v, v.slice(2)]) {
+    try {
+      const decoded = Buffer.from(cand, 'base64').toString('utf8');
+      if (/^https?:\/\//.test(decoded)) return decoded;
+    } catch (e) { /* try next form */ }
+  }
+  return null;
+}
+
 function parseBingResults(html) {
   const out = [];
   const blocks = html.match(/<li class="b_algo"[\s\S]*?<\/li>/g) || [];
   for (const b of blocks) {
-    const m = b.match(/<h2><a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a><\/h2>/);
+    const m = b.match(/<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>\s*<\/h2>/);
     if (!m) continue;
     // Bing HTML-escapes ampersands in hrefs (&amp;), so unescape first or
     // the u= parameter below never matches and every result is dropped.
@@ -822,7 +856,8 @@ function parseBingResults(html) {
     // Bing routes result links through /ck/a?...&u=<base64 of the real URL>
     const u = url.match(/[?&]u=([^&]+)/);
     if (u) {
-      try { url = Buffer.from(decodeURIComponent(u[1]), 'base64').toString('utf8'); } catch (e) { /* keep as-is */ }
+      const decoded = decodeBingU(u[1]);
+      if (decoded) url = decoded;
     }
     if (!/^https?:\/\//.test(url) || /bing\.com\//.test(url)) continue;
     const s = b.match(/<div class="b_caption"><p[^>]*>([\s\S]*?)<\/p>/);
@@ -831,6 +866,19 @@ function parseBingResults(html) {
       url,
       snippet: s ? stripHtmlToText(s[1]).slice(0, 300) : '',
     });
+  }
+  if (out.length) return out;
+  // Fallback: Bing sometimes serves a different SERP layout. Any /ck/a link
+  // with a base64 u= parameter is a result link regardless of its container.
+  const seen = new Set();
+  const re = /<a[^>]*href="https:\/\/www\.bing\.com\/ck\/a\?[^"]*?&amp;u=([^&"]+)[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
+  for (const m of html.matchAll(re)) {
+    const url = decodeBingU(m[1]);
+    if (!url || /bing\.com\//.test(url) || seen.has(url)) continue;
+    seen.add(url);
+    const title = stripHtmlToText(m[2]).slice(0, 200);
+    if (title) out.push({ title, url, snippet: '' });
+    if (out.length >= 10) break;
   }
   return out;
 }
@@ -884,7 +932,10 @@ async function webSearch(query) {
 }
 
 async function runResearchBrief(topic, lang) {
-  const results = await webSearch(topic);
+  // One retry: Bing's SERP layout varies per request and any provider can
+  // flake once, so a single empty result is retried before giving up.
+  let results = await webSearch(topic);
+  if (!results.length) results = await webSearch(topic);
   if (!results.length) throw new Error('web search returned no results');
   const top = results.slice(0, 5);
   const pages = await Promise.all(top.map(async (r) => {
@@ -970,10 +1021,13 @@ async function handleDeepResearch(req, res) {
     res.end(JSON.stringify({ error: 'lang must be id, en or zh' }));
     return;
   }
+  let deepJob = null;
   await x402PaidFlow(req, res, X402_DEEP_AMOUNT, 'research-deep', async (payer) => {
     const job = {
       jobId: 'job-' + Date.now().toString(36) + '-' + crypto.randomBytes(4).toString('hex'),
-      status: 'queued',
+      // awaiting_payment until settle succeeds: the worker only processes
+      // `queued` jobs, so a failed settle can never buy free work.
+      status: 'awaiting_payment',
       topic,
       lang,
       payer,
@@ -981,11 +1035,14 @@ async function handleDeepResearch(req, res) {
       updatedAt: new Date().toISOString(),
     };
     saveJob(job);
+    deepJob = job;
     return {
       status: 200,
       body: { service: 'research-deep', jobId: job.jobId, status: 'queued', statusUrl: '/x402/jobs/' + job.jobId, eta_minutes: '10-30', topic, lang },
       meta: { topic, jobId: job.jobId },
     };
+  }, async () => {
+    if (deepJob) { deepJob.status = 'queued'; saveJob(deepJob); }
   });
 }
 
