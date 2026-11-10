@@ -9,6 +9,17 @@ const http = require('http');
 const fs   = require('fs');
 const path = require('path');
 
+// x402 (optional — guarded: if the packages are missing the server still
+// boots and every other route keeps working; only /x402/verify degrades).
+let x402FacilitatorClient = null;
+try {
+  const { facilitator } = require('@coinbase/x402');
+  const { HTTPFacilitatorClient } = require('@x402/core/http');
+  x402FacilitatorClient = new HTTPFacilitatorClient(facilitator);
+} catch (err) {
+  console.log('[x402] facilitator client unavailable:', err.message);
+}
+
 const PORT          = process.env.PORT || 3000;
 const ZERO_ADDRESS  = '0x0000000000000000000000000000000000000000';
 const ADDR_RE       = /^0x[0-9a-fA-F]{40}$/;
@@ -517,6 +528,237 @@ async function handleBotwork(req, res) {
   res.end(JSON.stringify({ ok: true, taskId: task.taskId, status: 'queued', agent: 'zhi19' }));
 }
 
+// ─── x402 paid deep verification ────────────────────────────────────────────
+// GET /x402/verify?contract=0x...&from=0x...
+// Price: 0.50 USDC on Base (500000 raw, 6 decimals), payTo = TaskMarket wallet.
+// Flow: no X-PAYMENT header -> 402 with accepts; paid -> facilitator verify
+// (CDP keys from env CDP_API_KEY_ID / CDP_API_KEY_SECRET) -> deep triage ->
+// facilitator settle -> 200 report + X-PAYMENT-RESPONSE header.
+// The report is the DEEP version: the free /api/triage evidence plus a
+// PancakeSwap pair/liquidity check and a Sourcify source scan for
+// owner-control functions. The free endpoint stays free; this one is the
+// paid, deeper, per-request product.
+// Orchestration is manual on purpose: @x402/core's x402HTTPResourceServer
+// demands a registered scheme implementation for exact/base and its
+// initialize() needs facilitator auth even for the 402 path, so we call the
+// HTTPFacilitatorClient directly and build the 402 body ourselves.
+const X402_PAY_TO   = '0xf437F9fe8851Da07197ebd7C1bEa6504d45A7Ceb';
+const X402_ASSET    = '0x833589fCD6eDb6E08f4c7C32D4f71b54bd029029'; // USDC on Base
+const X402_AMOUNT   = '500000'; // 0.50 USDC, 6 decimals
+const X402_NETWORK  = 'eip155:8453';
+const X402_TIMEOUT  = 300;
+const X402_SALES_FILE = path.join(__dirname, 'x402-sales.jsonl');
+
+function x402Requirements() {
+  return {
+    scheme: 'exact',
+    network: X402_NETWORK,
+    asset: X402_ASSET,
+    amount: X402_AMOUNT,
+    payTo: X402_PAY_TO,
+    maxTimeoutSeconds: X402_TIMEOUT,
+    extra: { name: 'USDC', version: '2' },
+  };
+}
+
+function x402PaymentRequiredBody(error) {
+  return {
+    x402Version: 2,
+    error: error || 'Payment Required',
+    accepts: [x402Requirements()],
+  };
+}
+
+// ── Deep checks (paid report only) ──────────────────────────────────────────
+// PancakeSwap V2 pair + liquidity for the contract token (answers: sellable?).
+const PCS_FACTORY = '0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73';
+const WBNB_ADDR   = '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c';
+const USDT_BSC    = '0x55d398326f99059fF775485246999027B3197955';
+
+function padAddr(a) { return '000000000000000000000000' + a.slice(2).toLowerCase(); }
+
+async function checkOnePair(token, quote, quoteSymbol) {
+  try {
+    const pairData = await rpcCall(NODES[0], 'eth_call', [{
+      to: PCS_FACTORY,
+      data: '0xe6a43905' + padAddr(token) + padAddr(quote),
+    }, 'latest']);
+    const pair = '0x' + (pairData || '').slice(-40);
+    if (!pair || pair === '0x0000000000000000000000000000000000000000') {
+      return { quote: quoteSymbol, pair: null };
+    }
+    const [res, lp] = await Promise.all([
+      rpcCall(NODES[0], 'eth_call', [{ to: pair, data: '0x0902f1ac' }, 'latest']).catch(() => null),
+      rpcCall(NODES[0], 'eth_call', [{ to: pair, data: '0x18160ddd' }, 'latest']).catch(() => null),
+    ]);
+    const out = { quote: quoteSymbol, pair };
+    if (res && res !== '0x') {
+      out.reserve0 = BigInt('0x' + res.slice(2, 66)).toString();
+      out.reserve1 = BigInt('0x' + res.slice(66, 130)).toString();
+    }
+    if (lp && lp !== '0x') out.lpTotalSupply = BigInt(lp).toString();
+    return out;
+  } catch (err) {
+    return { quote: quoteSymbol, pair: null, error: err.message };
+  }
+}
+
+async function checkPairs(contract) {
+  const [wbnb, usdt] = await Promise.all([
+    checkOnePair(contract, WBNB_ADDR, 'WBNB'),
+    checkOnePair(contract, USDT_BSC, 'USDT'),
+  ]);
+  return { checked: true, wbnb, usdt };
+}
+
+// Sourcify source scan for owner-control / risky function names.
+async function scanSource(contract) {
+  const url = `https://sourcify.dev/server/v2/contract/56/${contract}?fields=sources`;
+  const result = await fetchJson(url);
+  if (!result.ok || !result.data || !result.data.sources) {
+    return { checked: false, error: result.error || 'sources unavailable' };
+  }
+  let text = '';
+  let files = 0;
+  for (const [name, entry] of Object.entries(result.data.sources)) {
+    if (entry && entry.content) { text += '\n' + entry.content; files += 1; }
+  }
+  const WATCH = [
+    'onlyOwner', 'setPrice', 'setBaseURI', 'setBaseUri', 'withdraw', 'pause',
+    'unpause', 'setFee', 'setTax', 'setMaxTx', 'setMaxWallet', 'blacklist',
+    'setMinter', 'mintToOwner', 'renounceOwnership', 'transferOwnership',
+  ];
+  const hits = {};
+  for (const w of WATCH) {
+    const n = (text.match(new RegExp(w, 'g')) || []).length;
+    if (n > 0) hits[w] = n;
+  }
+  return { checked: true, files, bytes: text.length, hits };
+}
+
+async function runDeepChecks(contract) {
+  const [pairs, source] = await Promise.all([
+    checkPairs(contract).catch((e) => ({ checked: false, error: e.message })),
+    scanSource(contract).catch((e) => ({ checked: false, error: e.message })),
+  ]);
+  return { pairs, source };
+}
+
+async function handleX402(req, res) {
+  const query = parseQuery(req.url);
+  const rawContract = (query.contract || '').trim();
+  if (!ADDR_RE.test(rawContract)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'contract must be a 0x address (40 hex chars)' }));
+    return;
+  }
+  const paymentHeader = req.headers['x-payment'];
+  if (!paymentHeader) {
+    res.writeHead(402, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(x402PaymentRequiredBody(), null, 2));
+    return;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(paymentHeader, 'base64').toString('utf8'));
+  } catch (err) {
+    res.writeHead(402, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(x402PaymentRequiredBody('Invalid X-PAYMENT header'), null, 2));
+    return;
+  }
+  // Shape-check before calling the facilitator: a malformed payload is a
+  // 402, not a facilitator error.
+  if (!payload || !payload.payload || !payload.payload.authorization ||
+      !payload.payload.authorization.from || !payload.payload.signature) {
+    res.writeHead(402, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(x402PaymentRequiredBody('Invalid payment payload'), null, 2));
+    return;
+  }
+  if (!x402FacilitatorClient) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'payment verification unavailable — facilitator not configured (CDP keys missing)' }));
+    return;
+  }
+  const requirements = x402Requirements();
+  let verify;
+  try {
+    verify = await x402FacilitatorClient.verify(payload, requirements);
+  } catch (err) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'payment verification failed', detail: err.message }));
+    return;
+  }
+  if (!verify || !verify.isValid) {
+    res.writeHead(402, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(x402PaymentRequiredBody(
+      (verify && (verify.invalidReason || verify.invalidMessage)) || 'Payment invalid'
+    ), null, 2));
+    return;
+  }
+  // Sim from the payer's wallet: can THIS buyer mint free?
+  const payer = (verify.payer ||
+    (payload.payload && payload.payload.authorization && payload.payload.authorization.from) || '').toLowerCase();
+  if (ADDR_RE.test(payer)) query.from = payer;
+  let triage;
+  try {
+    triage = await handleTriage(query);
+  } catch (err) {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Internal server error', detail: err.message }));
+    return;
+  }
+  if (triage.status !== 200) {
+    // Invalid input / triage failure: do NOT settle, buyer is not charged.
+    res.writeHead(triage.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(triage.body));
+    return;
+  }
+  const deep = await runDeepChecks(rawContract.toLowerCase());
+  let settle;
+  try {
+    settle = await x402FacilitatorClient.settle(payload, requirements);
+  } catch (err) {
+    res.writeHead(402, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(x402PaymentRequiredBody('Settlement failed: ' + err.message), null, 2));
+    return;
+  }
+  if (!settle || !settle.success) {
+    res.writeHead(402, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(x402PaymentRequiredBody(
+      'Settlement failed: ' + ((settle && (settle.errorReason || settle.error)) || 'unknown')
+    ), null, 2));
+    return;
+  }
+  const sale = {
+    ts: new Date().toISOString(),
+    payer,
+    transaction: settle.transaction || null,
+    network: settle.network || X402_NETWORK,
+    contract: rawContract.toLowerCase(),
+    amount: X402_AMOUNT,
+    asset: X402_ASSET,
+  };
+  fs.appendFile(X402_SALES_FILE, JSON.stringify(sale) + '\n', () => {});
+  console.log(`[x402] sale: ${sale.contract} paid by ${payer} tx ${sale.transaction}`);
+  const responseHeader = Buffer.from(JSON.stringify({
+    success: true,
+    transaction: settle.transaction || null,
+    network: settle.network || X402_NETWORK,
+    payer,
+  })).toString('base64');
+  const body = {
+    paid: true,
+    payment: sale,
+    ...triage.body,
+    deep,
+  };
+  res.writeHead(200, {
+    'Content-Type': 'application/json',
+    'X-PAYMENT-RESPONSE': responseHeader,
+  });
+  res.end(JSON.stringify(body, null, 2));
+}
+
 const server = http.createServer(async (req, res) => {
   const urlPath = req.url.split('?')[0];
 
@@ -533,6 +775,16 @@ const server = http.createServer(async (req, res) => {
   if (urlPath === '/botwork-tasks' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, agent: 'zhi19', tasks: botworkQueue }, null, 2));
+    return;
+  }
+
+  if (urlPath === '/x402/verify' && req.method === 'GET') {
+    try {
+      await handleX402(req, res);
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Internal server error', detail: err.message }));
+    }
     return;
   }
 
