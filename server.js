@@ -8,6 +8,7 @@
 const http = require('http');
 const fs   = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // x402 (optional — guarded: if the packages are missing the server still
 // boots and every other route keeps working; only /x402/verify degrades).
@@ -528,44 +529,49 @@ async function handleBotwork(req, res) {
   res.end(JSON.stringify({ ok: true, taskId: task.taskId, status: 'queued', agent: 'zhi19' }));
 }
 
-// ─── x402 paid deep verification ────────────────────────────────────────────
-// GET /x402/verify?contract=0x...&from=0x...
-// Price: 0.50 USDC on Base (500000 raw, 6 decimals), payTo = TaskMarket wallet.
-// Flow: no X-PAYMENT header -> 402 with accepts; paid -> facilitator verify
-// (CDP keys from env CDP_API_KEY_ID / CDP_API_KEY_SECRET) -> deep triage ->
-// facilitator settle -> 200 report + X-PAYMENT-RESPONSE header.
-// The report is the DEEP version: the free /api/triage evidence plus a
-// PancakeSwap pair/liquidity check and a Sourcify source scan for
-// owner-control functions. The free endpoint stays free; this one is the
-// paid, deeper, per-request product.
+// ─── x402 paid services ─────────────────────────────────────────────────────
+// Three paid products share one flow (x402PaidFlow): no X-PAYMENT header ->
+// 402 with accepts; paid -> facilitator verify (CDP keys from env) ->
+// produce() -> facilitator settle -> 200 + X-PAYMENT-RESPONSE header.
+// produce() runs BEFORE settle: if it fails, the buyer is NOT charged.
+//   GET /x402/verify?contract=0x...&from=0x...   — deep mint verification, $0.50
+//   GET /x402/research?topic=...&lang=id|en|zh  — research brief, $5, sync
+//   GET /x402/research-deep?topic=...&lang=...  — deep research report, $25, async job
+//   GET /x402/jobs/:id                          — deep job status + report
+//   GET /x402/jobs                              — recent deep jobs (worker poll)
+//   POST /x402/jobs/:id/result                  — worker ingest (X-JOB-SECRET)
 // Orchestration is manual on purpose: @x402/core's x402HTTPResourceServer
 // demands a registered scheme implementation for exact/base and its
 // initialize() needs facilitator auth even for the 402 path, so we call the
 // HTTPFacilitatorClient directly and build the 402 body ourselves.
 const X402_PAY_TO   = '0xf437F9fe8851Da07197ebd7C1bEa6504d45A7Ceb';
 const X402_ASSET    = '0x833589fCD6eDb6E08f4c7C32D4f71b54bd029029'; // USDC on Base
-const X402_AMOUNT   = '500000'; // 0.50 USDC, 6 decimals
 const X402_NETWORK  = 'eip155:8453';
 const X402_TIMEOUT  = 300;
+const X402_VERIFY_AMOUNT   = '500000';   // 0.50 USDC
+const X402_RESEARCH_AMOUNT = '5000000';  // 5 USDC
+const X402_DEEP_AMOUNT     = '25000000'; // 25 USDC
 const X402_SALES_FILE = path.join(__dirname, 'x402-sales.jsonl');
+const X402_JOBS_FILE  = path.join(__dirname, 'x402-jobs.jsonl');
+const X402_JOB_SECRET = process.env.X402_JOB_SECRET || '';
 
-function x402Requirements() {
+function x402Requirements(amount) {
   return {
     scheme: 'exact',
     network: X402_NETWORK,
     asset: X402_ASSET,
-    amount: X402_AMOUNT,
+    amount,
     payTo: X402_PAY_TO,
     maxTimeoutSeconds: X402_TIMEOUT,
     extra: { name: 'USDC', version: '2' },
   };
 }
 
-function x402PaymentRequiredBody(error) {
+function x402PaymentRequiredBody(error, amount) {
   return {
     x402Version: 2,
     error: error || 'Payment Required',
-    accepts: [x402Requirements()],
+    accepts: [x402Requirements(amount)],
   };
 }
 
@@ -644,18 +650,14 @@ async function runDeepChecks(contract) {
   return { pairs, source };
 }
 
-async function handleX402(req, res) {
-  const query = parseQuery(req.url);
-  const rawContract = (query.contract || '').trim();
-  if (!ADDR_RE.test(rawContract)) {
-    res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'contract must be a 0x address (40 hex chars)' }));
-    return;
-  }
+// ── Shared paid flow ────────────────────────────────────────────────────────
+// produce(payer) returns { status, body, meta } — meta is merged into the
+// sale record. Any non-200 status returns WITHOUT settling the payment.
+async function x402PaidFlow(req, res, amount, service, produce) {
   const paymentHeader = req.headers['x-payment'];
   if (!paymentHeader) {
     res.writeHead(402, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(x402PaymentRequiredBody(), null, 2));
+    res.end(JSON.stringify(x402PaymentRequiredBody(null, amount), null, 2));
     return;
   }
   let payload;
@@ -663,7 +665,7 @@ async function handleX402(req, res) {
     payload = JSON.parse(Buffer.from(paymentHeader, 'base64').toString('utf8'));
   } catch (err) {
     res.writeHead(402, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(x402PaymentRequiredBody('Invalid X-PAYMENT header'), null, 2));
+    res.end(JSON.stringify(x402PaymentRequiredBody('Invalid X-PAYMENT header', amount), null, 2));
     return;
   }
   // Shape-check before calling the facilitator: a malformed payload is a
@@ -671,7 +673,7 @@ async function handleX402(req, res) {
   if (!payload || !payload.payload || !payload.payload.authorization ||
       !payload.payload.authorization.from || !payload.payload.signature) {
     res.writeHead(402, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(x402PaymentRequiredBody('Invalid payment payload'), null, 2));
+    res.end(JSON.stringify(x402PaymentRequiredBody('Invalid payment payload', amount), null, 2));
     return;
   }
   if (!x402FacilitatorClient) {
@@ -679,7 +681,7 @@ async function handleX402(req, res) {
     res.end(JSON.stringify({ error: 'payment verification unavailable — facilitator not configured (CDP keys missing)' }));
     return;
   }
-  const requirements = x402Requirements();
+  const requirements = x402Requirements(amount);
   let verify;
   try {
     verify = await x402FacilitatorClient.verify(payload, requirements);
@@ -691,72 +693,360 @@ async function handleX402(req, res) {
   if (!verify || !verify.isValid) {
     res.writeHead(402, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(x402PaymentRequiredBody(
-      (verify && (verify.invalidReason || verify.invalidMessage)) || 'Payment invalid'
+      (verify && (verify.invalidReason || verify.invalidMessage)) || 'Payment invalid', amount
     ), null, 2));
     return;
   }
-  // Sim from the payer's wallet: can THIS buyer mint free?
   const payer = (verify.payer ||
     (payload.payload && payload.payload.authorization && payload.payload.authorization.from) || '').toLowerCase();
-  if (ADDR_RE.test(payer)) query.from = payer;
-  let triage;
+  let produced;
   try {
-    triage = await handleTriage(query);
+    produced = await produce(payer);
   } catch (err) {
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Internal server error', detail: err.message }));
     return;
   }
-  if (triage.status !== 200) {
-    // Invalid input / triage failure: do NOT settle, buyer is not charged.
-    res.writeHead(triage.status, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(triage.body));
+  if (!produced || produced.status !== 200) {
+    res.writeHead(produced ? produced.status : 500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(produced ? produced.body : { error: 'Internal server error' }));
     return;
   }
-  const deep = await runDeepChecks(rawContract.toLowerCase());
   let settle;
   try {
     settle = await x402FacilitatorClient.settle(payload, requirements);
   } catch (err) {
     res.writeHead(402, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(x402PaymentRequiredBody('Settlement failed: ' + err.message), null, 2));
+    res.end(JSON.stringify(x402PaymentRequiredBody('Settlement failed: ' + err.message, amount), null, 2));
     return;
   }
   if (!settle || !settle.success) {
     res.writeHead(402, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(x402PaymentRequiredBody(
-      'Settlement failed: ' + ((settle && (settle.errorReason || settle.error)) || 'unknown')
+      'Settlement failed: ' + ((settle && (settle.errorReason || settle.error)) || 'unknown'), amount
     ), null, 2));
     return;
   }
   const sale = {
     ts: new Date().toISOString(),
+    service,
     payer,
     transaction: settle.transaction || null,
     network: settle.network || X402_NETWORK,
-    contract: rawContract.toLowerCase(),
-    amount: X402_AMOUNT,
+    amount,
     asset: X402_ASSET,
+    ...(produced.meta || {}),
   };
   fs.appendFile(X402_SALES_FILE, JSON.stringify(sale) + '\n', () => {});
-  console.log(`[x402] sale: ${sale.contract} paid by ${payer} tx ${sale.transaction}`);
+  console.log(`[x402] sale: ${service} paid by ${payer} tx ${sale.transaction}`);
   const responseHeader = Buffer.from(JSON.stringify({
     success: true,
     transaction: settle.transaction || null,
     network: settle.network || X402_NETWORK,
     payer,
   })).toString('base64');
-  const body = {
-    paid: true,
-    payment: sale,
-    ...triage.body,
-    deep,
-  };
+  const body = { paid: true, payment: sale, ...produced.body };
   res.writeHead(200, {
     'Content-Type': 'application/json',
     'X-PAYMENT-RESPONSE': responseHeader,
   });
   res.end(JSON.stringify(body, null, 2));
+}
+
+async function handleX402(req, res) {
+  const query = parseQuery(req.url);
+  const rawContract = (query.contract || '').trim();
+  if (!ADDR_RE.test(rawContract)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'contract must be a 0x address (40 hex chars)' }));
+    return;
+  }
+  await x402PaidFlow(req, res, X402_VERIFY_AMOUNT, 'verify', async (payer) => {
+    // Sim from the payer's wallet: can THIS buyer mint free?
+    if (ADDR_RE.test(payer)) query.from = payer;
+    const triage = await handleTriage(query);
+    if (triage.status !== 200) return triage;
+    const deep = await runDeepChecks(rawContract.toLowerCase());
+    return { status: 200, body: { ...triage.body, deep }, meta: { contract: rawContract.toLowerCase() } };
+  });
+}
+
+// ── Research brief ($5, synchronous, extractive) ────────────────────────────
+// No LLM key lives on this server, so the brief is evidence-first: a live
+// web search plus the top pages fetched and excerpted, each finding naming
+// its source URL. Nothing is invented: findings are excerpts, never prose
+// the server wrote from nothing.
+const RESEARCH_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
+
+async function fetchText(url, timeoutMs = 10000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { headers: { 'User-Agent': RESEARCH_UA }, signal: ctrl.signal });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch (err) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function decodeEntities(s) {
+  return s
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'");
+}
+
+function stripHtmlToText(html) {
+  return decodeEntities(
+    html
+      .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<(noscript|svg|nav|footer|header)[\s\S]*?<\/(noscript|svg|nav|footer|header)>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+  ).replace(/\s+/g, ' ').trim();
+}
+
+function parseBingResults(html) {
+  const out = [];
+  const blocks = html.match(/<li class="b_algo"[\s\S]*?<\/li>/g) || [];
+  for (const b of blocks) {
+    const m = b.match(/<h2><a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a><\/h2>/);
+    if (!m) continue;
+    // Bing HTML-escapes ampersands in hrefs (&amp;), so unescape first or
+    // the u= parameter below never matches and every result is dropped.
+    let url = m[1].replace(/&amp;/g, '&');
+    // Bing routes result links through /ck/a?...&u=<base64 of the real URL>
+    const u = url.match(/[?&]u=([^&]+)/);
+    if (u) {
+      try { url = Buffer.from(decodeURIComponent(u[1]), 'base64').toString('utf8'); } catch (e) { /* keep as-is */ }
+    }
+    if (!/^https?:\/\//.test(url) || /bing\.com\//.test(url)) continue;
+    const s = b.match(/<div class="b_caption"><p[^>]*>([\s\S]*?)<\/p>/);
+    out.push({
+      title: stripHtmlToText(m[2]).slice(0, 200),
+      url,
+      snippet: s ? stripHtmlToText(s[1]).slice(0, 300) : '',
+    });
+  }
+  return out;
+}
+
+function parseDdgResults(html) {
+  const out = [];
+  const linkRe = /<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+  const snipRe = /<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+  const links = [...html.matchAll(linkRe)];
+  const snips = [...html.matchAll(snipRe)];
+  links.forEach((m, i) => {
+    let url = m[1];
+    // DDG wraps external links through //duckduckgo.com/l/?uddg=<encoded>
+    const uddg = url.match(/uddg=([^&]+)/);
+    if (uddg) { try { url = decodeURIComponent(uddg[1]); } catch (e) { /* keep as-is */ } }
+    if (!/^https?:\/\//.test(url)) return;
+    out.push({
+      title: stripHtmlToText(m[2]).slice(0, 200),
+      url,
+      snippet: snips[i] ? stripHtmlToText(snips[i][1]).slice(0, 300) : '',
+    });
+  });
+  return out;
+}
+
+// Search providers, in order: Bing HTML (works from this network), then
+// DuckDuckGo HTML, then DDG lite. DDG returns empty replies from this VM's
+// IPs (2026-11-10) but may work from Render's egress IPs, so it stays as a
+// fallback rather than being removed.
+async function webSearch(query) {
+  const bing = await fetchText('https://www.bing.com/search?q=' + encodeURIComponent(query) + '&count=10', 15000);
+  if (bing) {
+    const results = parseBingResults(bing);
+    if (results.length) return results;
+  }
+  const html = await fetchText('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query), 15000);
+  if (html) {
+    const results = parseDdgResults(html);
+    if (results.length) return results;
+  }
+  const lite = await fetchText('https://lite.duckduckgo.com/lite/?q=' + encodeURIComponent(query), 15000);
+  if (lite) {
+    const out = [];
+    const re = /<a[^>]+class="result-link"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    for (const m of lite.matchAll(re)) {
+      if (/^https?:\/\//.test(m[1])) out.push({ title: stripHtmlToText(m[2]).slice(0, 200), url: m[1], snippet: '' });
+    }
+    if (out.length) return out;
+  }
+  return [];
+}
+
+async function runResearchBrief(topic, lang) {
+  const results = await webSearch(topic);
+  if (!results.length) throw new Error('web search returned no results');
+  const top = results.slice(0, 5);
+  const pages = await Promise.all(top.map(async (r) => {
+    const html = await fetchText(r.url, 10000);
+    const text = html ? stripHtmlToText(html).slice(0, 4000) : '';
+    return { ...r, textLength: text.length, excerpt: (r.snippet || text.slice(0, 300)).slice(0, 300) };
+  }));
+  return {
+    service: 'research-brief',
+    topic,
+    lang,
+    generated_at: new Date().toISOString(),
+    sources_consulted: pages.length,
+    findings: pages.map((p) => ({ title: p.title, url: p.url, excerpt: p.excerpt })),
+    sources: pages.map((p) => p.url),
+    note: 'Extractive brief: every finding is an excerpt from its listed source. Verify claims against the sources before acting.',
+  };
+}
+
+async function handleResearch(req, res) {
+  const query = parseQuery(req.url);
+  const topic = (query.topic || '').trim();
+  const lang = (query.lang || 'en').trim().toLowerCase();
+  if (!topic || topic.length > 200) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'topic is required (max 200 chars), e.g. ?topic=Agent+Mining+AMNT' }));
+    return;
+  }
+  if (!['id', 'en', 'zh'].includes(lang)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'lang must be id, en or zh' }));
+    return;
+  }
+  await x402PaidFlow(req, res, X402_RESEARCH_AMOUNT, 'research-brief', async () => {
+    const brief = await runResearchBrief(topic, lang);
+    return { status: 200, body: brief, meta: { topic } };
+  });
+}
+
+// ── Deep research jobs ($25, async) ─────────────────────────────────────────
+// The buyer pays, gets a jobId, and polls GET /x402/jobs/:id. A worker on
+// Ara's own VM polls GET /x402/jobs, researches each queued job, and POSTs
+// the report to /x402/jobs/:id/result with X-JOB-SECRET.
+// Storage is an append-only JSONL file; the last line per jobId wins. Render's
+// free-tier filesystem is ephemeral, so a restart can lose queued jobs — the
+// sale log (x402-sales.jsonl) keeps payer + topic + tx, so a lost job can be
+// rebuilt and delivered by hand.
+const jobs = new Map();
+function loadJobs() {
+  try {
+    const lines = fs.readFileSync(X402_JOBS_FILE, 'utf8').split('\n').filter(Boolean);
+    for (const line of lines) {
+      try { const j = JSON.parse(line); if (j && j.jobId) jobs.set(j.jobId, j); } catch (e) { /* skip bad line */ }
+    }
+  } catch (err) { /* no jobs file yet */ }
+}
+loadJobs();
+
+function saveJob(job) {
+  job.updatedAt = new Date().toISOString();
+  jobs.set(job.jobId, job);
+  fs.appendFile(X402_JOBS_FILE, JSON.stringify(job) + '\n', () => {});
+}
+
+function publicJob(job) {
+  const out = { jobId: job.jobId, status: job.status, topic: job.topic, lang: job.lang, createdAt: job.createdAt, updatedAt: job.updatedAt };
+  if (job.status === 'done' && job.report) out.report = job.report;
+  if (job.status === 'failed' && job.error) out.error = job.error;
+  return out;
+}
+
+async function handleDeepResearch(req, res) {
+  const query = parseQuery(req.url);
+  const topic = (query.topic || '').trim();
+  const lang = (query.lang || 'en').trim().toLowerCase();
+  if (!topic || topic.length > 200) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'topic is required (max 200 chars)' }));
+    return;
+  }
+  if (!['id', 'en', 'zh'].includes(lang)) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'lang must be id, en or zh' }));
+    return;
+  }
+  await x402PaidFlow(req, res, X402_DEEP_AMOUNT, 'research-deep', async (payer) => {
+    const job = {
+      jobId: 'job-' + Date.now().toString(36) + '-' + crypto.randomBytes(4).toString('hex'),
+      status: 'queued',
+      topic,
+      lang,
+      payer,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    saveJob(job);
+    return {
+      status: 200,
+      body: { service: 'research-deep', jobId: job.jobId, status: 'queued', statusUrl: '/x402/jobs/' + job.jobId, eta_minutes: '10-30', topic, lang },
+      meta: { topic, jobId: job.jobId },
+    };
+  });
+}
+
+function handleJobStatus(req, res, jobId) {
+  const job = jobs.get(jobId);
+  if (!job) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'job not found' }));
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(publicJob(job), null, 2));
+}
+
+function handleJobsList(req, res) {
+  const list = [...jobs.values()]
+    .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+    .slice(0, 20)
+    .map((j) => ({ jobId: j.jobId, status: j.status, topic: j.topic, lang: j.lang, createdAt: j.createdAt, updatedAt: j.updatedAt }));
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, jobs: list }, null, 2));
+}
+
+async function handleJobResult(req, res, jobId) {
+  if (!X402_JOB_SECRET || req.headers['x-job-secret'] !== X402_JOB_SECRET) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'unauthorized' }));
+    return;
+  }
+  const job = jobs.get(jobId);
+  if (!job) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'job not found' }));
+    return;
+  }
+  let body = '';
+  req.on('data', (c) => { body += c; if (body.length > 200000) req.destroy(); });
+  req.on('end', () => {
+    let data;
+    try { data = JSON.parse(body || '{}'); } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid JSON body' }));
+      return;
+    }
+    if (!['working', 'done', 'failed'].includes(data.status)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'status must be working, done or failed' }));
+      return;
+    }
+    if (data.status === 'done' && (!data.report || typeof data.report !== 'object')) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'done requires a report object' }));
+      return;
+    }
+    job.status = data.status;
+    if (data.report) job.report = data.report;
+    if (data.error) job.error = String(data.error).slice(0, 500);
+    saveJob(job);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, job: publicJob(job) }));
+  });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -781,6 +1071,46 @@ const server = http.createServer(async (req, res) => {
   if (urlPath === '/x402/verify' && req.method === 'GET') {
     try {
       await handleX402(req, res);
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Internal server error', detail: err.message }));
+    }
+    return;
+  }
+
+  if (urlPath === '/x402/research' && req.method === 'GET') {
+    try {
+      await handleResearch(req, res);
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Internal server error', detail: err.message }));
+    }
+    return;
+  }
+
+  if (urlPath === '/x402/research-deep' && req.method === 'GET') {
+    try {
+      await handleDeepResearch(req, res);
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Internal server error', detail: err.message }));
+    }
+    return;
+  }
+
+  if (urlPath === '/x402/jobs' && req.method === 'GET') {
+    handleJobsList(req, res);
+    return;
+  }
+
+  if (urlPath.startsWith('/x402/jobs/') && req.method === 'GET') {
+    handleJobStatus(req, res, urlPath.slice('/x402/jobs/'.length).split('/')[0]);
+    return;
+  }
+
+  if (urlPath.startsWith('/x402/jobs/') && req.method === 'POST' && urlPath.endsWith('/result')) {
+    try {
+      await handleJobResult(req, res, urlPath.slice('/x402/jobs/'.length).split('/')[0]);
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Internal server error', detail: err.message }));
