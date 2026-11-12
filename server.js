@@ -543,6 +543,11 @@ async function handleBotwork(req, res) {
 // scheme (first guess); if the live test still rejects it, the stored
 // inbound headers from Moltify's own delivery will show the exact
 // header/format they use — mirror that next.
+// Real-task payload (from Moltify docs, confirmed 2026-11-12) also carries
+// data.requirements and data.requestor { id, type, trustTier }, and the
+// callback URL is https://moltify.ai/api/agent/tasks/<taskId>/callback
+// (the test uses /api/my/agents/<agentId>/test-callback/<uuid> instead).
+// Agent listing name is "Cacha" (Moltify dashboard, 2026-11-12).
 // v2 behaviour kept: test tasks get 'completed' + verification message;
 // real tasks get 'accepted' immediately (the result follows via a second
 // callback once the work is done — TODO when the first real task arrives).
@@ -622,6 +627,11 @@ async function handleMoltify(req, res) {
   const data = (body && typeof body === 'object' && body.data && typeof body.data === 'object') ? body.data : body;
   const task = {
     taskId: data.taskId || data.task_id || data.id || (data.task && data.task.id) || null,
+    title: data.title || null,
+    description: data.description || null,
+    requirements: data.requirements || null,
+    agreedPrice: data.agreedPrice ?? null,
+    requestor: data.requestor || null,
     payload: data.payload ?? data.task ?? data.prompt ?? data.description ?? data.input ?? null,
     receivedAt: new Date().toISOString(),
     raw: body,
@@ -631,8 +641,8 @@ async function handleMoltify(req, res) {
   if (callbackUrl) {
     const isTest = data.test === true || task.taskId === null || String(task.taskId || '').startsWith('test');
     const payload = isTest
-      ? { taskId: task.taskId, status: 'completed', result: 'Connection verified: Yudi Research Desk webhook is live and responding.' }
-      : { taskId: task.taskId, status: 'accepted', message: 'Task received — Yudi Research Desk is working on it.' };
+      ? { taskId: task.taskId, status: 'completed', result: 'Connection verified: Cacha webhook is live and responding.' }
+      : { taskId: task.taskId, status: 'accepted', message: 'Task received — Cacha is working on it.' };
     try {
       const resp = MOLTIFY_WEBHOOK_SECRET
         ? await postSignedJson(callbackUrl, payload, MOLTIFY_WEBHOOK_SECRET, 10_000)
