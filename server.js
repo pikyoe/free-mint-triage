@@ -529,17 +529,38 @@ async function handleBotwork(req, res) {
   res.end(JSON.stringify({ ok: true, taskId: task.taskId, status: 'queued', agent: 'zhi19' }));
 }
 
-// ─── Moltify agent webhook (v1) ─────────────────────────────────────────────
-// Moltify sends buyer tasks here as POST JSON and expects a fast 200.
-// No public webhook payload spec is published by Moltify (checked
-// 2026-11-12); v1 accepts any JSON, queues it, and answers
-// { ok, taskId, status: 'queued', agent: 'zhi19' } — same shape as the
-// BotWork v1 webhook. Task execution + delivery-back follow Moltify's
-// dashboard contract once the builder test call shows the exact payload
-// and expected response. Queue is also listed at GET /moltify-tasks.
-// NOTE: Render free tier sleeps when idle — first hit after idle wakes ~50s.
+// ─── Moltify agent webhook (v2) ─────────────────────────────────────────────
+// Moltify sends buyer tasks as POST { event: 'task.submitted', timestamp,
+// data: { taskId, agentId, title, description, agreedPrice, status,
+// callbackUrl, test } } and expects the agent to POST back to
+// data.callbackUrl within 15s ("Callback round-trip" test).
+// Verified 2026-11-12: POST { taskId, status, result } to a callbackUrl
+// returns 200 {"received":true} with no auth header needed.
+// v2: test tasks get 'completed' + verification message; real tasks get
+// 'accepted' immediately (the result follows via a second callback once
+// the work is done — TODO when the first real task arrives). The callback
+// is awaited (10s cap) before the 200 reply so it always goes out fast.
+// Queue is listed at GET /moltify-tasks; each entry records its callback.
+// NOTE: Render free tier sleeps when idle — first hit after idle wakes
+// ~50s. The 5-min BotWork queue-watch poll keeps the instance warm.
 const MOLTIFY_TASKS_FILE = path.join(__dirname, 'moltify-tasks.jsonl');
 let moltifyQueue = [];
+
+// POST JSON with a hard timeout. Returns the fetch Response.
+async function postJson(url, obj, timeoutMs = 10_000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(obj),
+      signal: ctrl.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function moltifyStore(task) {
   moltifyQueue.push(task);
@@ -566,12 +587,28 @@ async function handleMoltify(req, res) {
     res.end(JSON.stringify({ ok: false, error: 'invalid JSON body' }));
     return;
   }
+  const data = (body && typeof body === 'object' && body.data && typeof body.data === 'object') ? body.data : body;
   const task = {
-    taskId: body.taskId || body.task_id || body.id || (body.task && body.task.id) || null,
-    payload: body.payload ?? body.task ?? body.prompt ?? body.description ?? body.input ?? null,
+    taskId: data.taskId || data.task_id || data.id || (data.task && data.task.id) || null,
+    payload: data.payload ?? data.task ?? data.prompt ?? data.description ?? data.input ?? null,
     receivedAt: new Date().toISOString(),
     raw: body,
   };
+  const callbackUrl = data.callbackUrl || data.callback_url || body.callbackUrl || null;
+  if (callbackUrl) {
+    const isTest = data.test === true || task.taskId === null || String(task.taskId || '').startsWith('test');
+    const payload = isTest
+      ? { taskId: task.taskId, status: 'completed', result: 'Connection verified: Yudi Research Desk webhook is live and responding.' }
+      : { taskId: task.taskId, status: 'accepted', message: 'Task received — Yudi Research Desk is working on it.' };
+    try {
+      const resp = await postJson(callbackUrl, payload, 10_000);
+      task.callback = { ok: resp.ok, status: resp.status };
+      console.log(`[moltify] callback ${resp.status} for ${task.taskId}`);
+    } catch (err) {
+      task.callback = { ok: false, error: String((err && err.message) || err).slice(0, 120) };
+      console.log(`[moltify] callback failed for ${task.taskId}: ${task.callback.error}`);
+    }
+  }
   moltifyStore(task);
   console.log(`[moltify] task received: ${task.taskId}`);
   res.writeHead(200, { 'Content-Type': 'application/json' });
