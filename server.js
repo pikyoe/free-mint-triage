@@ -536,13 +536,15 @@ async function handleBotwork(req, res) {
 // data.callbackUrl within 15s ("Callback round-trip" test).
 // Verified 2026-11-12: POST { taskId, status, result } to a callbackUrl
 // returns 200 {"received":true} with no auth header needed.
-// v3: the callback is HMAC-signed — HMAC-SHA256(secret, raw JSON body),
-// hex digest in header X-Moltify-Signature (plus X-Webhook-Signature with
-// the same value as a fallback name). The secret lives ONLY in the Render
-// env var MOLTIFY_WEBHOOK_SECRET, never in code. This is the standard
-// scheme (first guess); if the live test still rejects it, the stored
-// inbound headers from Moltify's own delivery will show the exact
-// header/format they use — mirror that next.
+// v3: the callback is HMAC-signed. PROVEN scheme (verified 2026-11-12
+// against Moltify's own inbound signature on test_05a28b72):
+//   X-Moltify-Signature: hex HMAC-SHA256(secret, timestamp + '.' + rawBody)
+//   X-Moltify-Timestamp: Unix milliseconds as a string (e.g. 1794466274187)
+// (v3 signed HMAC(secret, rawBody) with no timestamp — Moltify rejected
+// it. v4 adds the timestamp prefix + header.) X-Webhook-Signature carries
+// the same digest as a fallback name. The secret lives ONLY in the Render
+// env var MOLTIFY_WEBHOOK_SECRET, never in code. Inbound deliveries are
+// verified the same way (log-only, never blocking).
 // Real-task payload (from Moltify docs, confirmed 2026-11-12) also carries
 // data.requirements and data.requestor { id, type, trustTier }, and the
 // callback URL is https://moltify.ai/api/agent/tasks/<taskId>/callback
@@ -576,11 +578,14 @@ async function postJson(url, obj, timeoutMs = 10_000) {
   }
 }
 
-// POST JSON signed with HMAC-SHA256(secret, rawBody). The signature covers
-// the exact raw bytes sent — never a re-serialized copy.
+// POST JSON signed with Moltify's scheme: HMAC-SHA256(secret,
+// timestamp + '.' + rawBody), hex digest in X-Moltify-Signature plus the
+// timestamp itself in X-Moltify-Timestamp. The signature covers the exact
+// raw bytes sent — never a re-serialized copy.
 async function postSignedJson(url, obj, secret, timeoutMs = 10_000) {
   const raw = JSON.stringify(obj);
-  const sig = crypto.createHmac('sha256', secret).update(raw, 'utf8').digest('hex');
+  const ts = String(Date.now());
+  const sig = crypto.createHmac('sha256', secret).update(ts + '.' + raw, 'utf8').digest('hex');
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
@@ -589,6 +594,7 @@ async function postSignedJson(url, obj, secret, timeoutMs = 10_000) {
       headers: {
         'Content-Type': 'application/json',
         'X-Moltify-Signature': sig,
+        'X-Moltify-Timestamp': ts,
         'X-Webhook-Signature': sig,
       },
       body: raw,
@@ -596,6 +602,21 @@ async function postSignedJson(url, obj, secret, timeoutMs = 10_000) {
     });
   } finally {
     clearTimeout(timer);
+  }
+}
+
+// Verify an inbound Moltify delivery against its X-Moltify-Signature /
+// X-Moltify-Timestamp headers. Returns true/false/null (null = no
+// signature headers present or no secret configured). Log-only use.
+function verifyMoltifySignature(rawBody, headers, secret) {
+  const sig = headers['x-moltify-signature'];
+  const ts = headers['x-moltify-timestamp'];
+  if (!sig || !ts || !secret) return null;
+  const expected = crypto.createHmac('sha256', secret).update(ts + '.' + rawBody, 'utf8').digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(expected, 'utf8'));
+  } catch (_) {
+    return false;
   }
 }
 
@@ -617,8 +638,10 @@ async function handleMoltify(req, res) {
     return;
   }
   let body;
+  let rawBody = '';
   try {
-    body = JSON.parse(await readBody(req));
+    rawBody = await readBody(req);
+    body = JSON.parse(rawBody);
   } catch (err) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: false, error: 'invalid JSON body' }));
@@ -636,6 +659,7 @@ async function handleMoltify(req, res) {
     receivedAt: new Date().toISOString(),
     raw: body,
     headers: Object.fromEntries(Object.entries(req.headers).filter(([k]) => !k.includes('authorization'))),
+    signatureValid: verifyMoltifySignature(rawBody, req.headers, MOLTIFY_WEBHOOK_SECRET),
   };
   const callbackUrl = data.callbackUrl || data.callback_url || body.callbackUrl || null;
   if (callbackUrl) {
