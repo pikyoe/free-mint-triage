@@ -529,6 +529,55 @@ async function handleBotwork(req, res) {
   res.end(JSON.stringify({ ok: true, taskId: task.taskId, status: 'queued', agent: 'zhi19' }));
 }
 
+// ─── Moltify agent webhook (v1) ─────────────────────────────────────────────
+// Moltify sends buyer tasks here as POST JSON and expects a fast 200.
+// No public webhook payload spec is published by Moltify (checked
+// 2026-11-12); v1 accepts any JSON, queues it, and answers
+// { ok, taskId, status: 'queued', agent: 'zhi19' } — same shape as the
+// BotWork v1 webhook. Task execution + delivery-back follow Moltify's
+// dashboard contract once the builder test call shows the exact payload
+// and expected response. Queue is also listed at GET /moltify-tasks.
+// NOTE: Render free tier sleeps when idle — first hit after idle wakes ~50s.
+const MOLTIFY_TASKS_FILE = path.join(__dirname, 'moltify-tasks.jsonl');
+let moltifyQueue = [];
+
+function moltifyStore(task) {
+  moltifyQueue.push(task);
+  if (moltifyQueue.length > 200) moltifyQueue = moltifyQueue.slice(-200);
+  fs.appendFile(MOLTIFY_TASKS_FILE, JSON.stringify(task) + '\n', () => {});
+}
+
+async function handleMoltify(req, res) {
+  if (req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, agent: 'zhi19', queued: moltifyQueue.length }));
+    return;
+  }
+  if (req.method !== 'POST') {
+    res.writeHead(405, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'method not allowed' }));
+    return;
+  }
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (err) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'invalid JSON body' }));
+    return;
+  }
+  const task = {
+    taskId: body.taskId || body.task_id || body.id || (body.task && body.task.id) || null,
+    payload: body.payload ?? body.task ?? body.prompt ?? body.description ?? body.input ?? null,
+    receivedAt: new Date().toISOString(),
+    raw: body,
+  };
+  moltifyStore(task);
+  console.log(`[moltify] task received: ${task.taskId}`);
+  res.writeHead(200, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ ok: true, taskId: task.taskId, status: 'queued', agent: 'zhi19' }));
+}
+
 // ─── x402 paid services ─────────────────────────────────────────────────────
 // Three paid products share one flow (x402PaidFlow): no X-PAYMENT header ->
 // 402 with accepts; paid -> facilitator verify (CDP keys from env) ->
@@ -1122,6 +1171,22 @@ const server = http.createServer(async (req, res) => {
   if (urlPath === '/botwork-tasks' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, agent: 'zhi19', tasks: botworkQueue }, null, 2));
+    return;
+  }
+
+  if (urlPath === '/moltify-webhook') {
+    try {
+      await handleMoltify(req, res);
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Internal server error' }));
+    }
+    return;
+  }
+
+  if (urlPath === '/moltify-tasks' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, agent: 'zhi19', tasks: moltifyQueue }, null, 2));
     return;
   }
 
